@@ -1,0 +1,367 @@
+---
+title: "PRODUCT RECOMMENDATION SYSTEM"
+output: html_document
+---
+
+### IMPORTING LIBRARIES
+#### Dataset link: https://archive.ics.uci.edu/ml/datasets/online+retail#
+#### Google site link: https://sites.google.com/view/recommendersystem/phase-3?authuser=0
+```{r}
+rm(list=ls())
+library(data.table)           
+library(readxl)               
+library(tidyverse)
+library(lubridate)
+library(skimr)                
+library(knitr)                
+library(treemap)
+#install.packages("recommenderlab")
+library(recommenderlab)
+```
+
+### DATA PREPROCESSING
+
+```{r}
+# import raw data file and trim leading and trailing white spaces
+retail <- read_excel("Online Retail (1).xlsx", trim_ws = TRUE)
+# First glance at the data
+#View(retail)
+retail %>%  skim()
+
+
+# CANCELLATIONS
+# if the InvoiceNo starts with letter 'C', it indicates a cancellation
+retail %>% 
+  filter(grepl("C", retail$InvoiceNo)) %>% 
+  summarise(Total = n())
+
+# Cancellations are not needed for the analysis so they can be removed
+retail  <- retail %>% 
+  filter(!grepl("C", retail$InvoiceNo)) 
+
+#nrow(retail) 532621
+
+
+# NEGATIVE QUANTITIES
+# filtering by non positive Quantity. 
+retail %>% 
+  filter(Quantity <= 0) %>% 
+  group_by(Description, UnitPrice) %>% 
+  summarise(count =n()) %>%
+  arrange(desc(count)) %>% 
+  ungroup()
+
+# remove all rows with non-positive _Quantity_. 
+
+retail  <- retail %>%
+  filter(Quantity > 0)
+
+# nrow(retail) - 531,285
+
+# NON-PRODUCT STOCKCODES 
+# There are some non-product related codes
+stc <- c('AMAZONFEE', 'BANK CHARGES', 'C2', 'DCGSSBOY', 'DCGSSGIRL',
+         'DOT', 'gift_0001_', 'PADS', 'POST')
+
+# Summary
+retail %>%  
+  filter(grepl(paste(stc, collapse="|"), StockCode))  %>% 
+  group_by(StockCode, Description) %>% 
+  summarise(count = n()) %>%
+  arrange(desc(count)) %>% 
+  ungroup()
+
+# These can all be removed. 
+retail <- filter(retail, !grepl(paste(stc, collapse="|"), StockCode))
+
+nrow(retail)
+
+sum(is.na(retail$Description))
+retail <- retail %>% 
+  filter(!is.na(Description))
+
+sum(is.na(retail$Description))
+
+# NAs in _CustomerID_. 
+retail$CustomerID %>%  
+  skim()
+
+
+# there are almost 5 times as many Orders as there are Customers  
+sapply(retail[,c('InvoiceNo','CustomerID')], function(x) length(unique(x)))
+
+
+# setting the datatypes of different columns right.
+retail <- retail %>%
+  # Setting 'Description' and 'Country' as factors
+  mutate(Description = as.factor(Description)) %>%
+  mutate(Country = as.factor(Country)) %>% 
+  # Changing 'InvoiceNo' type to numeric
+  mutate(InvoiceNo = as.numeric(InvoiceNo)) %>% 
+  # Extracting 'Date' and 'Time' from 'InvoiceDate'
+  mutate(Date = as.Date(InvoiceDate)) %>% 
+  mutate(Time = as.factor(format(InvoiceDate,"%H:%M:%S"))) 
+
+glimpse(retail)
+```
+
+### EXPLORATORY DATA ANALYSIS
+
+#### What items do people buy more often?
+
+```{r}
+retail %>% 
+  group_by(Description) %>% 
+  summarize(count = n()) %>% 
+  top_n(10, wt = count) %>%
+  arrange(desc(count)) %>% 
+  ggplot(aes(x = reorder(Description, count), y = count))+
+  geom_bar(stat = "identity", fill = "royalblue", colour = "blue") +
+  labs(x = "", y = "Top 10 Best Sellers", title = "Most Ordered Products") +
+  coord_flip() + theme_grey(base_size = 12)
+```
+The heart-shaped tea light holder is the most popular item. 
+
+
+
+
+#### Top 10 most sold products 
+
+```{r}
+retail %>% 
+  group_by(Description) %>% 
+  summarize(count = n()) %>% 
+  mutate(pct=(count/sum(count))*100) %>% 
+  arrange(desc(pct)) %>% 
+  ungroup() %>% 
+  top_n(10, wt=pct)
+```
+Top 10 most sold products represent around 3% of total items sold by the company 
+
+
+
+
+#### What time of day do people buy more often?
+
+```{r}
+retail %>% 
+  ggplot(aes(hour(hms(Time)))) + 
+  geom_histogram(stat = "count",fill = "#E69F00", colour = "red") +
+  labs(x = "Hour of Day", y = "") +
+  theme_grey(base_size = 12)
+```
+Lunchtime is the preferred time for shopping online, with the majority of orders places between 12 noon and 3pm. 
+
+
+
+
+#### What day of the week do people buy more often?
+
+```{r}
+retail %>% 
+  ggplot(aes(wday(Date, 
+                  week_start = getOption("lubridate.week.start", 1)))) + 
+  geom_histogram(stat = "count" , fill = "forest green", colour = "dark green") +
+  labs(x = "Day of Week", y = "") +
+  scale_x_continuous(breaks = c(1,2,3,4,5,6,7),
+                     labels = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")) +
+  theme_grey(base_size = 14)
+```
+Orders peaks on Thursdays with no orders processed on Saturdays. 
+
+
+
+
+#### How many items does each customer buy?
+
+```{r}
+retail %>% 
+  group_by(InvoiceNo) %>% 
+  summarise(n = mean(Quantity)) %>%
+  ggplot(aes(x=n)) +
+  geom_histogram(bins = 100000, fill = "purple", colour = "black") + 
+  coord_cartesian(xlim=c(0,100)) +
+  scale_x_continuous(breaks=seq(0,100,10)) +
+  labs(x = "Average Number of Items per Purchase", y = "") +
+  theme_grey(base_size = 14)
+```
+The large majority of customers typically purchase between 2 and 15 items, with a peak at 2. 
+
+
+
+
+#### What is the average value per order?
+ 
+```{r}
+retail %>% 
+  mutate(Value = UnitPrice * Quantity) %>% 
+  group_by(InvoiceNo) %>% 
+  summarise(n = mean(Value)) %>%
+  ggplot(aes(x=n)) +
+  geom_histogram(bins = 200000, fill="firebrick3", colour = "sandybrown") + 
+  coord_cartesian(xlim=c(0,100)) +
+  scale_x_continuous(breaks=seq(0,100,10)) +
+  labs(x = "Average Value per Purchase", y = "") + 
+  theme_grey(base_size = 14)
+```
+The bulk of orders have a value below £20, with the distribution showing a double peak, one at £6 and a more pronounced one at £17.
+
+
+
+
+
+#### Country wise Tree map based on quantity ordered
+
+```{r}
+treemap(retail,
+        index      = c("Country"),
+        vSize      = "Quantity",
+        title      = "",
+        palette    = "Set2",
+        border.col = "grey40")
+
+```
+Majority of orders come from the United Kingdom. 
+
+
+
+
+
+### LET'S BUILD A RECOMMENDER SYSTEM
+
+```{r}
+# Filtering by an order number which contains the same stock code more than once 
+# to show duplicate items within same order
+retail %>% 
+  filter(InvoiceNo == 557886 & StockCode == 22436) %>% 
+  select(InvoiceNo, StockCode, Quantity, UnitPrice, CustomerID)
+
+# Removing duplicates 
+retail <- retail %>%  # create unique identifier
+  mutate(InNo_Desc = paste(InvoiceNo, Description, sep = ' ')) # filter out duplicates 
+retail <- retail[!duplicated(retail$InNo_Desc), ] %>% 
+  select(-InNo_Desc) # drop unique identifier
+
+nrow(retail)
+
+ratings_matrix <- retail %>%# Select only needed variables
+  select(InvoiceNo, Description) %>% # Add a column of 1s
+  mutate(value = 1) %>%# Spread into user-item format
+  spread(Description, value, fill = 0) %>%
+  select(-InvoiceNo) %>%# Convert to matrix
+  as.matrix() %>%# Convert to recommenderlab class 'binaryRatingsMatrix'
+  as("binaryRatingMatrix")
+
+ratings_matrix
+
+# Creating evaluation scheme
+scheme <- ratings_matrix %>% 
+  evaluationScheme(method = "cross",
+                   k      = 5, 
+                   train  = 0.8,
+                   given  = -1)
+
+algorithms <- list(
+  "association rules" = list(name  = "AR", 
+                             param = list(supp = 0.01, conf = 0.01)),
+  "random items"      = list(name  = "RANDOM",  param = NULL),
+  "popular items"     = list(name  = "POPULAR", param = NULL),
+  "item-based CF"     = list(name  = "IBCF", param = list(k = 5)),
+  "user-based CF"     = list(name  = "UBCF", 
+                             param = list(method = "Cosine", nn = 500))
+)
+
+# Estimating the Models
+results <- recommenderlab::evaluate(scheme, 
+                                    algorithms, 
+                                    type  = "topNList", 
+                                    n     = c(1, 3, 5, 10, 15, 20)
+)
+
+results
+
+# Results for each single model can be easily retrieved and inspected. 
+results$'popular' %>% 
+  getConfusionMatrix() 
+
+# Sort out results 
+avg_conf_matr <- function(results) {
+  tmp <- results %>%
+    getConfusionMatrix()  %>%  
+    as.list() 
+  as.data.frame( Reduce("+",tmp) / length(tmp)) %>% 
+    mutate(n = c(1, 3, 5, 10, 15, 20)) %>%
+    select('n', 'precision', 'recall', 'TPR', 'FPR') 
+}
+
+
+# use  `map()` to get all results in a tidy format
+
+results_tbl <- results %>%
+  map(avg_conf_matr) %>% 
+  enframe() %>% 
+  unnest() 
+```
+
+### Testing the model
+```{r}
+# ROC curve
+results_tbl %>%
+  ggplot(aes(FPR, TPR, colour = fct_reorder2(as.factor(name), FPR, TPR))) +
+  geom_line() +
+  geom_label(aes(label = n))  +
+  labs(title = "ROC curves",
+       colour = "Model") +
+  theme_grey(base_size = 14)
+
+# Precision-Recall curve
+results_tbl %>%
+  ggplot(aes(recall, precision, 
+             colour = fct_reorder2(as.factor(name),  precision, recall))) +
+  geom_line() +
+  geom_label(aes(label = n))  +
+  labs(title = "Precision-Recall curves",
+       colour = "Model") +
+  theme_grey(base_size = 14)
+```
+Item Based Collaborative Filtering has given the best results and we will be making predictions based on IBCF.
+
+
+
+## Predictions for a new user
+```{r}
+# creaing a made-up order.
+customer_order <- c("GREEN REGENCY TEACUP AND SAUCER",
+                    "SET OF 3 BUTTERFLY COOKIE CUTTERS",
+                    "JAM MAKING SET WITH JARS",
+                    "SET OF TEA COFFEE SUGAR TINS PANTRY",
+                    "SET OF 4 PANTRY JELLY MOULDS")
+
+
+# put string in a format that recommenderlab accepts.
+new_order_rat_matrx <- retail %>% 
+  select(Description) %>% 
+  unique() %>% 
+  mutate(value = as.numeric(Description %in% customer_order)) %>% 
+  spread(key = Description, value = value) %>% 
+  as.matrix() %>% # Change to a matrix
+  as("binaryRatingMatrix") # Convert to recommenderlab class 'binaryRatingsMatrix'
+
+
+# create a `Recommender`
+recomm <- Recommender(getData(scheme, 'train'), 
+                      method = "IBCF",   
+                      param = list(k = 5))
+
+pred <- predict(recomm, 
+                newdata = new_order_rat_matrx, 
+                n       = 10)
+
+
+# inspect prediction as a list
+as(pred, 'list')
+```
+
+
+### SUMMARY
+Started with cleaning the data set and exploring the data set. Next we go on to the model building phase where we first create a rating matrix and then creating a evaluation scheme and model validation and setting up a list of algorithms we wanted to evaluate. Training the model and visualizing the results. According to the ROC curve, item based Cf is the best trained one.The precision recall plot confirms that item-based Collaborative Filter (IBCF) is the best model because it has higher Recall for any given level of Precision. Then at last we make predictions.
